@@ -1,0 +1,64 @@
+__id__ = "continuous_animations"
+__name__ = "Continuous Animations"
+__description__ = "Keeps emoji statuses and video avatars looping"
+__author__ = "soranerai"
+__version__ = "1.1.1"
+__min_version__ = "12.8.1"
+
+import base64
+from typing import Any, List
+
+from base_plugin import BasePlugin
+from java.nio import ByteBuffer
+from dalvik.system import InMemoryDexClassLoader
+from org.telegram.messenger import AndroidUtilities, ApplicationLoader
+from ui.settings import Header, Text
+
+_DEX_B64 = "{{DEX_B64}}"
+_MAIN_CLASS = "app.soranerai.continuousanimations.Main"
+
+
+class ContinuousAnimationsPlugin(BasePlugin):
+    def __init__(self):
+        self._logs = []
+        self._main_class = None
+        self._dex_loader = None
+
+    def log(self, message):
+        self._logs.append(str(message))
+        try:
+            super().log(message)
+        except Exception:
+            pass
+
+    def on_plugin_load(self):
+        try:
+            dex = base64.b64decode(_DEX_B64)
+            self._dex_loader = InMemoryDexClassLoader(
+                ByteBuffer.wrap(dex), ApplicationLoader.applicationContext.getClassLoader()
+            )
+            self._main_class = self._dex_loader.loadClass(_MAIN_CLASS)
+            self._main_class.getMethod("initAndStart").invoke(None)
+            self.log("Continuous Animations DEX loaded")
+            self.log(str(self._main_class.getMethod("getStatus").invoke(None)))
+        except Exception as error:
+            self.log(f"Continuous Animations failed: {error}")
+
+    def create_settings(self) -> List[Any]:
+        return [
+            Header(text="Continuous Animations"),
+            Text(text="Copy diagnostics", subtext="Send this if animations do not loop",
+                 icon="msg_copy", on_click=self._copy_logs),
+        ]
+
+    def _copy_logs(self, _view=None):
+        AndroidUtilities.addToClipboard("\n".join(self._logs) or "No loader logs")
+
+    def on_plugin_unload(self):
+        if self._main_class is not None:
+            try:
+                self._main_class.getMethod("unload").invoke(None)
+            except Exception:
+                pass
+        self._main_class = None
+        self._dex_loader = None

@@ -1,0 +1,15 @@
+name: Build plugin
+on:
+  push:
+  pull_request:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y default-jdk dalvik-exchange
+      - run: make verify
+      - uses: actions/upload-artifact@v4
+        with:
+          name: continuous_animations.plugin
+          path: dist/continuous_animations.plugin
