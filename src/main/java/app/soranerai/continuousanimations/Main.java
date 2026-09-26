@@ -6,7 +6,7 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
-import org.telegram.messenger.AndroidUtilities;
+import android.os.Looper;
 import org.telegram.messenger.ImageReceiver;
 import org.telegram.ui.Components.AnimatedEmojiDrawable;
 
@@ -14,65 +14,37 @@ import org.telegram.ui.Components.AnimatedEmojiDrawable;
 public final class Main {
     private static final int CACHE_TYPE_EMOJI_STATUS = 7;
     private static final int CACHE_TYPE_ALERT_EMOJI_STATUS = 9;
-    private static final int MAX_INSTALL_ATTEMPTS = 6;
-    private static final long RETRY_BASE_DELAY_MS = 300L;
 
     private static final HookRegistry HOOKS = new HookRegistry();
     private static boolean started;
-    private static int installAttempts;
-    private static Runnable scheduledRetry;
+    private static volatile boolean active;
     private static String status = "not started";
 
     private Main() {
     }
 
     public static synchronized void initAndStart() {
-        if (started || scheduledRetry != null) {
+        if (started) {
             return;
         }
 
-        installHooks();
+        started = true;
+        active = true;
+        try {
+            installHooks();
+        } catch (Throwable error) {
+            active = false;
+            logError("initialization failed", error);
+        }
     }
 
     private static void installHooks() {
         int installed = 0;
         installed += installEmojiStatusHook();
-        installed += installAvatarHooks();
-        started = installed > 0;
-        if (started) {
-            log("installed " + installed + " hooks");
-        } else {
-            scheduleInstallRetry();
+        if (active) {
+            installed += installAvatarHooks();
         }
-    }
-
-    private static void scheduleInstallRetry() {
-        if (installAttempts >= MAX_INSTALL_ATTEMPTS) {
-            log("no compatible hooks found after " + installAttempts + " attempts");
-            return;
-        }
-
-        installAttempts++;
-        final long delay = RETRY_BASE_DELAY_MS * installAttempts;
-        scheduledRetry = new Runnable() {
-            @Override
-            public void run() {
-                synchronized (Main.class) {
-                    scheduledRetry = null;
-                    if (!started) {
-                        installHooks();
-                    }
-                }
-            }
-        };
-        log("hook installation retry " + installAttempts + "/" + MAX_INSTALL_ATTEMPTS
-                + " in " + delay + " ms");
-        try {
-            AndroidUtilities.runOnUIThread(scheduledRetry, delay);
-        } catch (Throwable error) {
-            scheduledRetry = null;
-            log("retry scheduler unavailable: " + error.getClass().getSimpleName());
-        }
+        log("installed " + installed + " hooks; automatic retries disabled");
     }
 
     private static int installEmojiStatusHook() {
@@ -86,7 +58,7 @@ public final class Main {
             }
             return HOOKS.install(updateAutoRepeat, new EmojiStatusHook(cacheType)) ? 1 : 0;
         } catch (Throwable error) {
-            log("emoji-status hook unavailable: " + error.getClass().getSimpleName());
+            logError("emoji-status hook unavailable", error);
             return 0;
         }
     }
@@ -94,31 +66,39 @@ public final class Main {
     private static int installAvatarHooks() {
         int installed = 0;
         try {
+            Method target = null;
+            boolean ambiguous = false;
             for (Method method : ImageReceiver.class.getDeclaredMethods()) {
                 if ("setForUserOrChat".equals(method.getName())
-                        && HOOKS.install(method, new AvatarHook())) {
-                    installed++;
+                        && method.getReturnType() == void.class
+                        && !java.lang.reflect.Modifier.isStatic(method.getModifiers())) {
+                    if (target == null || method.getParameterTypes().length
+                            > target.getParameterTypes().length) {
+                        target = method;
+                        ambiguous = false;
+                    } else if (method.getParameterTypes().length == target.getParameterTypes().length) {
+                        ambiguous = true;
+                    }
                 }
             }
+            if (ambiguous) {
+                log("avatar hook unavailable: ambiguous overloads");
+                return 0;
+            }
+            if (target != null && HOOKS.install(target, new AvatarHook())) {
+                installed = 1;
+            }
         } catch (Throwable error) {
-            log("avatar hooks unavailable: " + error.getClass().getSimpleName());
+            logError("avatar hooks unavailable", error);
         }
         log("installed " + installed + " avatar hooks");
         return installed;
     }
 
     public static synchronized void unload() {
-        if (scheduledRetry != null) {
-            try {
-                AndroidUtilities.cancelRunOnUIThread(scheduledRetry);
-            } catch (Throwable ignored) {
-                // The retry is also guarded by the cleared reference below.
-            }
-            scheduledRetry = null;
-        }
+        active = false;
         HOOKS.uninstallAll();
-        started = false;
-        installAttempts = 0;
+        // This classloader is single-use; stale callbacks can never become active again.
         log("unloaded");
     }
 
@@ -127,11 +107,29 @@ public final class Main {
     }
 
     private static void log(String message) {
-        status += "\n" + message;
+        try {
+            status += "\n" + message;
+            if (status.length() > 16384) {
+                status = status.substring(status.length() - 16384);
+            }
+        } catch (Throwable ignored) {
+            // Diagnostics must not escape into the hook dispatcher.
+        }
+    }
+
+    private static void logError(String context, Throwable error) {
+        try {
+            java.io.StringWriter buffer = new java.io.StringWriter();
+            error.printStackTrace(new java.io.PrintWriter(buffer));
+            log(context + ": " + buffer);
+        } catch (Throwable ignored) {
+        }
     }
 
     private static final class EmojiStatusHook extends XC_MethodHook {
         private final Field cacheType;
+        private boolean failed;
+        private boolean running;
 
         EmojiStatusHook(Field cacheType) {
             this.cacheType = cacheType;
@@ -139,8 +137,10 @@ public final class Main {
 
         @Override
         protected void afterHookedMethod(MethodHookParam param) {
+          synchronized (Main.class) {
             try {
-                if (param == null
+                if (!active || failed || running || Looper.myLooper() != Looper.getMainLooper()
+                        || param == null || param.hasThrowable()
                         || !(param.thisObject instanceof AnimatedEmojiDrawable)
                         || param.args == null
                         || param.args.length == 0
@@ -149,24 +149,43 @@ public final class Main {
                 }
                 int type = cacheType.getInt(param.thisObject);
                 if (type == CACHE_TYPE_EMOJI_STATUS || type == CACHE_TYPE_ALERT_EMOJI_STATUS) {
-                    AnimationLoop.apply(param.args[0]);
+                    running = true;
+                    try {
+                        AnimationLoop.apply(param.args[0]);
+                    } finally {
+                        running = false;
+                    }
                 }
-            } catch (Throwable ignored) {
-                // A rendering hook must never interrupt Telegram's UI thread.
+            } catch (Throwable error) {
+                failed = true;
+                logError("emoji callback disabled", error);
             }
+          }
         }
     }
 
     private static final class AvatarHook extends XC_MethodHook {
+        private boolean failed;
+        private boolean running;
         @Override
         protected void afterHookedMethod(MethodHookParam param) {
+          synchronized (Main.class) {
             try {
-                if (param != null && param.thisObject instanceof ImageReceiver) {
-                    AnimationLoop.apply(param.thisObject);
+                if (active && !failed && !running && Looper.myLooper() == Looper.getMainLooper()
+                        && param != null && !param.hasThrowable()
+                        && param.thisObject instanceof ImageReceiver) {
+                    running = true;
+                    try {
+                        AnimationLoop.apply(param.thisObject);
+                    } finally {
+                        running = false;
+                    }
                 }
-            } catch (Throwable ignored) {
-                // The receiver can be incomplete while it is being recycled.
+            } catch (Throwable error) {
+                failed = true;
+                logError("avatar callback disabled", error);
             }
+          }
         }
     }
 
@@ -176,9 +195,17 @@ public final class Main {
         boolean install(Method method, XC_MethodHook callback) {
             try {
                 method.setAccessible(true);
-                hooks.add(XposedBridge.hookMethod(method, callback));
+                XC_MethodHook.Unhook hook = XposedBridge.hookMethod(method, callback);
+                if (hook == null) {
+                    active = false;
+                    log("registration returned no handle; callbacks disabled");
+                    return false;
+                }
+                hooks.add(hook);
                 return true;
-            } catch (Throwable ignored) {
+            } catch (Throwable error) {
+                active = false;
+                logError("hook registration failed: " + method.getName(), error);
                 return false;
             }
         }
@@ -187,8 +214,8 @@ public final class Main {
             for (XC_MethodHook.Unhook hook : hooks) {
                 try {
                     hook.unhook();
-                } catch (Throwable ignored) {
-                    // Continue unhooking even if Telegram discarded one hook.
+                } catch (Throwable error) {
+                    logError("unhook failed; callback remains inactive", error);
                 }
             }
             hooks.clear();
@@ -200,19 +227,10 @@ public final class Main {
         private AnimationLoop() {
         }
 
-        static void apply(Object receiver) {
-            try {
-                Reflection.invoke(receiver, "setAutoRepeatCount", new Class<?>[] {int.class}, -1);
-                Reflection.setIntField(receiver, "animatedFileDrawableRepeatMaxCount", 0);
-
-                Object animation = Reflection.invoke(receiver, "getAnimation", new Class<?>[0]);
-                if (animation != null) {
-                    Reflection.setIntField(animation, "repeatCount", 0);
-                }
-                Reflection.invoke(receiver, "startAnimation", new Class<?>[] {boolean.class}, true);
-            } catch (Throwable ignored) {
-                // Linkage and initialization errors are deliberately contained.
-            }
+        static void apply(Object receiver) throws Exception {
+            Reflection.invoke(receiver, "setAutoRepeatCount", new Class<?>[] {int.class}, -1);
+            Reflection.setIntField(receiver, "animatedFileDrawableRepeatMaxCount", 0);
+            // Playback scheduling and drawable lifetime remain owned by Telegram.
         }
     }
 
@@ -229,7 +247,7 @@ public final class Main {
                 } catch (NoSuchFieldException ignored) {
                     // Look in the parent class.
                 } catch (Throwable error) {
-                    return null;
+                    throw new IllegalStateException("Cannot access field " + name, error);
                 }
             }
             return null;
@@ -244,7 +262,7 @@ public final class Main {
                 } catch (NoSuchMethodException ignored) {
                     // Look in the parent class.
                 } catch (Throwable error) {
-                    return null;
+                    throw new IllegalStateException("Cannot access method " + name, error);
                 }
             }
             return null;
@@ -253,7 +271,10 @@ public final class Main {
         static Object invoke(Object target, String name, Class<?>[] parameterTypes, Object... args)
                 throws Exception {
             Method method = findMethod(target.getClass(), name, parameterTypes);
-            return method == null ? null : method.invoke(target, args);
+            if (method == null) {
+                throw new NoSuchMethodException(name);
+            }
+            return method.invoke(target, args);
         }
 
         static void setIntField(Object target, String name, int value) throws IllegalAccessException {
